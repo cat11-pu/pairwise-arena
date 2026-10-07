@@ -17,7 +17,7 @@ def _align_up(value, align):
     """Round value up to the next multiple of align."""
     if align <= 1:
         return value
-    return (value // align) * align
+    return ((value + align - 1) // align) * align
 
 
 def _check_size(size):
@@ -79,11 +79,13 @@ class Arena:
             strategy = self.strategy
         if strategy not in STRATEGIES:
             raise ValueError("unknown strategy: %r" % (strategy,))
-        need = size
-        prev, node = self._search(need, align, strategy)
+        # A zero length request still needs a unique anchor byte so that two
+        # such allocations never share an address.
+        span = size if size > 0 else 1
+        prev, node = self._search(span, align, strategy)
         if node is None:
             return None
-        return self._take(prev, node, need, align, size)
+        return self._take(prev, node, span, align, size)
 
     def free(self, pointer):
         """Release an address that alloc returned."""
@@ -97,9 +99,9 @@ class Arena:
         if not isinstance(data, (bytes, bytearray)):
             raise TypeError("data must be bytes")
         record = self._lookup(pointer)
+        if len(data) > record.usable:
+            raise ArenaError("write past the end of the allocation at %d" % (pointer,))
         end = pointer + len(data)
-        if end > self.capacity:
-            raise ArenaError("write past the end of the arena at %d" % (pointer,))
         self._buffer[pointer:end] = data
         return len(data)
 
@@ -110,9 +112,9 @@ class Arena:
         if size < 0:
             raise ValueError("size must not be negative")
         record = self._lookup(pointer)
+        if size > record.usable:
+            raise ArenaError("read past the end of the allocation at %d" % (pointer,))
         end = pointer + size
-        if end > self.capacity:
-            raise ArenaError("read past the end of the arena at %d" % (pointer,))
         return bytes(self._buffer[pointer:end])
 
     def stats(self):
@@ -150,45 +152,57 @@ class Arena:
 
     def _pointer_for(self, node, align):
         """The first offset inside node that satisfies align."""
-        pointer = _align_up(node.offset, align)
-        if pointer < node.offset:
-            pointer = node.offset
-        return pointer
+        return _align_up(node.offset, align)
+
+    def _fits(self, node, span, align):
+        """The aligned start, padding and fit status for one free node."""
+        pointer = self._pointer_for(node, align)
+        pad = pointer - node.offset
+        if pad + span > node.size:
+            return None
+        return pointer, pad
 
     def _search(self, need, align, strategy):
         prev = None
         node = self._head
         best = None
         best_prev = None
+        best_waste = None
         while node is not None:
-            if node.size >= need:
+            fit = self._fits(node, need, align)
+            if fit is not None:
+                pointer, pad = fit
                 if strategy == "first":
                     return prev, node
-                if best is None or node.size < best.size:
+                waste = node.size - pad - need
+                if best is None or waste < best_waste:
                     best = node
                     best_prev = prev
+                    best_waste = waste
             prev = node
             node = node.next
         return best_prev, best
 
-    def _take(self, prev, node, need, align, requested):
+    def _take(self, prev, node, span, align, requested):
         block_start = node.offset
         block_size = node.size
-        pointer = self._pointer_for(node, align)
-        pad = pointer - block_start
-        tail = block_size - pad - need
-        front = pad if pad >= MIN_BLOCK else 0
-        back = tail if tail > MIN_BLOCK else 0
+        pointer, pad = self._fits(node, span, align)
         if prev is None:
             self._head = node.next
         else:
             prev.next = node.next
-        if front:
-            self._insert_free(pointer, front)
-        if back:
-            self._insert_free(pointer + need, back)
-        start = block_start + front
-        size = block_size - front - back
+        tail = block_size - pad - span
+        if pad >= MIN_BLOCK:
+            self._insert_free(block_start, pad)
+            start = pointer
+        else:
+            start = block_start
+        if tail >= MIN_BLOCK:
+            self._insert_free(pointer + span, tail)
+            end = pointer + span
+        else:
+            end = block_start + block_size
+        size = end - start
         self._live[pointer] = _LiveRange(pointer, start, size, requested)
         return pointer
 
@@ -204,11 +218,17 @@ class Arena:
     def _insert_free(self, offset, size):
         """Return the range to the free list, joining it to its neighbours."""
         prev, node = self._locate(offset)
-        merged = _FreeRange(offset, size, self._head)
-        self._head = merged
         if prev is not None and prev.offset + prev.size == offset:
             prev.size += size
+            if node is not None and prev.offset + prev.size == node.offset:
+                prev.size += node.size
+                prev.next = node.next
             return
-        if merged.next is not None and merged.offset + merged.size == merged.next.offset:
-            merged.size += merged.next.size
-            merged.next = merged.next.next
+        merged = _FreeRange(offset, size, node)
+        if prev is None:
+            self._head = merged
+        else:
+            prev.next = merged
+        if node is not None and merged.offset + merged.size == node.offset:
+            merged.size += node.size
+            merged.next = node.next
